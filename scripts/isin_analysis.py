@@ -136,6 +136,23 @@ def fetch_prices(symbol: str, range_: str, interval: str) -> PriceSeries:
     return PriceSeries(dates=dates, closes=clean_closes)
 
 
+def load_series(path: str) -> PriceSeries:
+    with open(path, "r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+    dates = [dt.date.fromisoformat(value) for value in payload["dates"]]
+    closes = [float(value) for value in payload["closes"]]
+    return PriceSeries(dates=dates, closes=closes)
+
+
+def save_series(path: str, series: PriceSeries) -> None:
+    payload = {
+        "dates": [value.isoformat() for value in series.dates],
+        "closes": series.closes,
+    }
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, ensure_ascii=False, indent=2)
+
+
 def _returns(prices: Iterable[float]) -> List[float]:
     prices_list = list(prices)
     return [
@@ -235,6 +252,14 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
     )
     parser.add_argument("isin", help="Codice ISIN, es. IE00BF2GFH28")
     parser.add_argument(
+        "--input-data",
+        help="Percorso JSON con dati locali (salvati con --save-data)",
+    )
+    parser.add_argument(
+        "--save-data",
+        help="Percorso JSON per salvare i dati scaricati prima dell'analisi",
+    )
+    parser.add_argument(
         "--range",
         dest="range_",
         default="1y",
@@ -255,14 +280,21 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
 def main(argv: List[str]) -> int:
     args = parse_args(argv)
 
-    if args.symbol:
-        symbol = args.symbol
-        name = args.symbol
+    if args.input_data:
+        series = load_series(args.input_data)
+        symbol = args.symbol or "LOCAL_DATA"
+        name = symbol
         currency = ""
     else:
-        symbol, name, currency = search_symbol(args.isin)
-
-    series = fetch_prices(symbol, args.range_, args.interval)
+        if args.symbol:
+            symbol = args.symbol
+            name = args.symbol
+            currency = ""
+        else:
+            symbol, name, currency = search_symbol(args.isin)
+        series = fetch_prices(symbol, args.range_, args.interval)
+        if args.save_data:
+            save_series(args.save_data, series)
     result = analyze(symbol, name, currency, series)
     print_report(result)
     return 0
