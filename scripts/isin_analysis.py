@@ -38,6 +38,7 @@ class AnalysisResult:
     total_return: float
     annualized_volatility: float
     max_drawdown: float
+    rsi_14: float | None
     sma_50: float | None
     sma_200: float | None
 
@@ -163,11 +164,25 @@ def _simple_moving_average(prices: List[float], window: int) -> float | None:
     return sum(slice_) / window
 
 
+def _rsi(returns: List[float], window: int) -> float | None:
+    if len(returns) < window:
+        return None
+    gains = [r for r in returns[-window:] if r > 0]
+    losses = [-r for r in returns[-window:] if r < 0]
+    avg_gain = sum(gains) / window if gains else 0.0
+    avg_loss = sum(losses) / window if losses else 0.0
+    if avg_loss == 0:
+        return 100.0
+    rs = avg_gain / avg_loss
+    return 100 - (100 / (1 + rs))
+
+
 def analyze(symbol: str, name: str, currency: str, series: PriceSeries) -> AnalysisResult:
     returns = _returns(series.closes)
     total_return = (series.closes[-1] / series.closes[0]) - 1
     volatility = statistics.pstdev(returns) * math.sqrt(TRADING_DAYS) if returns else 0.0
     max_drawdown = _max_drawdown(series.closes)
+    rsi_14 = _rsi(returns, 14)
     sma_50 = _simple_moving_average(series.closes, 50)
     sma_200 = _simple_moving_average(series.closes, 200)
 
@@ -182,6 +197,7 @@ def analyze(symbol: str, name: str, currency: str, series: PriceSeries) -> Analy
         total_return=total_return,
         annualized_volatility=volatility,
         max_drawdown=max_drawdown,
+        rsi_14=rsi_14,
         sma_50=sma_50,
         sma_200=sma_200,
     )
@@ -205,6 +221,8 @@ def print_report(result: AnalysisResult) -> None:
     print(f"Rendimento totale: {_format_pct(result.total_return)}")
     print(f"Volatilità annualizzata: {_format_pct(result.annualized_volatility)}")
     print(f"Max drawdown: {_format_pct(result.max_drawdown)}")
+    if result.rsi_14 is not None:
+        print(f"RSI 14gg: {result.rsi_14:.2f}")
     if result.sma_50 is not None:
         print(f"Media mobile 50gg: {result.sma_50:.4f}")
     if result.sma_200 is not None:
