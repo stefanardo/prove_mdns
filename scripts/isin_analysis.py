@@ -300,6 +300,16 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
         help="Simbolo Yahoo da usare al posto della ricerca ISIN",
     )
     parser.add_argument(
+        "--check-request",
+        action="store_true",
+        help="Esegue solo il download dati per verificare la richiesta (senza analisi)",
+    )
+    parser.add_argument(
+        "--no-retry",
+        action="store_true",
+        help="Disabilita i retry automatici (utile per testare una singola richiesta)",
+    )
+    parser.add_argument(
         "--retries",
         type=int,
         default=DEFAULT_RETRIES,
@@ -334,6 +344,9 @@ def main(argv: List[str]) -> int:
         timeout=args.timeout,
         throttle=args.throttle,
     )
+    if args.no_retry:
+        config.retries = 0
+        config.backoff = 0.0
 
     try:
         if args.input_data:
@@ -351,6 +364,14 @@ def main(argv: List[str]) -> int:
             series = fetch_prices(symbol, args.range_, args.interval, config)
             if args.save_data:
                 save_series(args.save_data, series)
+            if args.check_request:
+                print("Richiesta OK: dati scaricati con successo.")
+                print(f"Punti: {len(series.closes)}")
+                print(
+                    "Periodo: "
+                    f"{series.dates[0].isoformat()} -> {series.dates[-1].isoformat()}"
+                )
+                return 0
         result = analyze(symbol, name, currency, series)
         print_report(result)
         return 0

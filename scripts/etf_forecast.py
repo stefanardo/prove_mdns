@@ -232,6 +232,16 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
     parser.add_argument("--epochs", type=int, default=500)
     parser.add_argument("--lr", type=float, default=0.1)
     parser.add_argument(
+        "--check-request",
+        action="store_true",
+        help="Esegue solo il download dati per verificare la richiesta (senza analisi)",
+    )
+    parser.add_argument(
+        "--no-retry",
+        action="store_true",
+        help="Disabilita i retry automatici (utile per testare una singola richiesta)",
+    )
+    parser.add_argument(
         "--retries",
         type=int,
         default=DEFAULT_RETRIES,
@@ -266,8 +276,16 @@ def main(argv: List[str]) -> int:
         timeout=args.timeout,
         throttle=args.throttle,
     )
+    if args.no_retry:
+        config.retries = 0
+        config.backoff = 0.0
     try:
         dates, prices = fetch_prices(args.symbol, args.range_, args.interval, config)
+        if args.check_request:
+            print("Richiesta OK: dati scaricati con successo.")
+            print(f"Punti: {len(prices)}")
+            print(f"Periodo: {dates[0].isoformat()} -> {dates[-1].isoformat()}")
+            return 0
         features, targets = build_dataset(prices)
         if not features:
             raise ValueError("Feature set empty; try a longer range")
