@@ -22,6 +22,7 @@ DEFAULT_TIMEOUT = 20
 DEFAULT_RETRIES = 5
 DEFAULT_BACKOFF = 2.0
 DEFAULT_THROTTLE = 1.5
+DEFAULT_DEBUG = False
 _LAST_REQUEST_AT = 0.0
 
 
@@ -31,6 +32,7 @@ class RequestConfig:
     backoff: float = DEFAULT_BACKOFF
     timeout: float = DEFAULT_TIMEOUT
     throttle: float = DEFAULT_THROTTLE
+    debug: bool = DEFAULT_DEBUG
 
 
 @dataclass
@@ -80,12 +82,26 @@ def _fetch_json(url: str, config: RequestConfig) -> dict:
     while attempt <= config.retries:
         try:
             _throttle_requests(config.throttle)
+            if config.debug:
+                print(f"DEBUG request URL: {url}", file=sys.stderr)
             request = urllib.request.Request(url, headers=headers)
             with urllib.request.urlopen(request, timeout=config.timeout) as response:
+                if config.debug:
+                    print(
+                        "DEBUG response: "
+                        f"status={response.status} content-type={response.headers.get('Content-Type')}",
+                        file=sys.stderr,
+                    )
                 payload = response.read().decode("utf-8")
             return json.loads(payload)
         except urllib.error.HTTPError as exc:
             last_error = exc
+            if config.debug:
+                print(
+                    "DEBUG HTTPError: "
+                    f"status={exc.code} retry-after={exc.headers.get('Retry-After')}",
+                    file=sys.stderr,
+                )
             if exc.code not in {429, 500, 502, 503, 504} or attempt == config.retries:
                 raise
             retry_after = exc.headers.get("Retry-After")
@@ -333,6 +349,11 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
         default=DEFAULT_THROTTLE,
         help="Attesa minima tra richieste HTTP (secondi)",
     )
+    parser.add_argument(
+        "--debug-http",
+        action="store_true",
+        help="Stampa informazioni di debug sulle richieste HTTP",
+    )
     return parser.parse_args(argv)
 
 
@@ -343,6 +364,7 @@ def main(argv: List[str]) -> int:
         backoff=args.backoff,
         timeout=args.timeout,
         throttle=args.throttle,
+        debug=args.debug_http,
     )
     if args.no_retry:
         config.retries = 0
