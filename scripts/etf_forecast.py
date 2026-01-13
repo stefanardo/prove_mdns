@@ -15,7 +15,8 @@ import urllib.request
 from dataclasses import dataclass
 from typing import List, Sequence, Tuple
 
-YAHOO_CHART_URL = "https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
+DEFAULT_CHART_HOST = "query1.finance.yahoo.com"
+YAHOO_CHART_PATH = "/v8/finance/chart/{symbol}"
 DEFAULT_TIMEOUT = 20
 DEFAULT_RETRIES = 5
 DEFAULT_BACKOFF = 2.0
@@ -31,6 +32,7 @@ class RequestConfig:
     timeout: float = DEFAULT_TIMEOUT
     throttle: float = DEFAULT_THROTTLE
     debug: bool = DEFAULT_DEBUG
+    chart_host: str = DEFAULT_CHART_HOST
 
 
 def _throttle_requests(throttle: float) -> None:
@@ -77,6 +79,14 @@ def _fetch_json(url: str, config: RequestConfig) -> dict:
                     f"status={exc.code} retry-after={exc.headers.get('Retry-After')}",
                     file=sys.stderr,
                 )
+                if exc.headers:
+                    debug_headers = {
+                        key: exc.headers.get(key)
+                        for key in ["Date", "Content-Type", "X-RateLimit-Remaining"]
+                        if exc.headers.get(key) is not None
+                    }
+                    if debug_headers:
+                        print(f"DEBUG headers: {debug_headers}", file=sys.stderr)
             if exc.code not in {429, 500, 502, 503, 504} or attempt == config.retries:
                 raise
             retry_after = exc.headers.get("Retry-After")
@@ -106,7 +116,7 @@ def fetch_prices(
     config: RequestConfig,
 ) -> Tuple[List[dt.date], List[float]]:
     params = urllib.parse.urlencode({"range": range_, "interval": interval})
-    url = f"{YAHOO_CHART_URL.format(symbol=symbol)}?{params}"
+    url = f"https://{config.chart_host}{YAHOO_CHART_PATH.format(symbol=symbol)}?{params}"
     data = _fetch_json(url, config)
     result = data.get("chart", {}).get("result", [])
     if not result:
@@ -286,6 +296,11 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
         action="store_true",
         help="Stampa informazioni di debug sulle richieste HTTP",
     )
+    parser.add_argument(
+        "--chart-host",
+        default=DEFAULT_CHART_HOST,
+        help="Hostname Yahoo per i prezzi (default query1.finance.yahoo.com)",
+    )
     return parser.parse_args(argv)
 
 
@@ -297,6 +312,7 @@ def main(argv: List[str]) -> int:
         timeout=args.timeout,
         throttle=args.throttle,
         debug=args.debug_http,
+        chart_host=args.chart_host,
     )
     if args.no_retry:
         config.retries = 0
