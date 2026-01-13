@@ -12,12 +12,37 @@ import sys
 import time
 import urllib.parse
 import urllib.request
+from dataclasses import dataclass
 from typing import List, Sequence, Tuple
 
 YAHOO_CHART_URL = "https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
+DEFAULT_TIMEOUT = 20
+DEFAULT_RETRIES = 5
+DEFAULT_BACKOFF = 2.0
+DEFAULT_THROTTLE = 1.5
+_LAST_REQUEST_AT = 0.0
 
 
-def _fetch_json(url: str, retries: int = 5, backoff: float = 2.0) -> dict:
+@dataclass
+class RequestConfig:
+    retries: int = DEFAULT_RETRIES
+    backoff: float = DEFAULT_BACKOFF
+    timeout: float = DEFAULT_TIMEOUT
+    throttle: float = DEFAULT_THROTTLE
+
+
+def _throttle_requests(throttle: float) -> None:
+    global _LAST_REQUEST_AT
+    if throttle <= 0:
+        return
+    now = time.monotonic()
+    elapsed = now - _LAST_REQUEST_AT
+    if elapsed < throttle:
+        time.sleep(throttle - elapsed)
+    _LAST_REQUEST_AT = time.monotonic()
+
+
+def _fetch_json(url: str, config: RequestConfig) -> dict:
     headers = {
         "User-Agent": (
             "Mozilla/5.0 (X11; Linux x86_64) "
@@ -27,15 +52,16 @@ def _fetch_json(url: str, retries: int = 5, backoff: float = 2.0) -> dict:
     }
     attempt = 0
     last_error: Exception | None = None
-    while attempt <= retries:
+    while attempt <= config.retries:
         try:
+            _throttle_requests(config.throttle)
             request = urllib.request.Request(url, headers=headers)
-            with urllib.request.urlopen(request, timeout=15) as response:
+            with urllib.request.urlopen(request, timeout=config.timeout) as response:
                 payload = response.read().decode("utf-8")
             return json.loads(payload)
         except urllib.error.HTTPError as exc:
             last_error = exc
-            if exc.code not in {429, 500, 502, 503, 504} or attempt == retries:
+            if exc.code not in {429, 500, 502, 503, 504} or attempt == config.retries:
                 raise
             retry_after = exc.headers.get("Retry-After")
             if retry_after:
@@ -47,9 +73,9 @@ def _fetch_json(url: str, retries: int = 5, backoff: float = 2.0) -> dict:
                     pass
         except urllib.error.URLError as exc:
             last_error = exc
-            if attempt == retries:
+            if attempt == config.retries:
                 raise
-        sleep_for = backoff * (2**attempt)
+        sleep_for = config.backoff * (2**attempt)
         time.sleep(sleep_for)
         attempt += 1
     if last_error is not None:
@@ -57,10 +83,15 @@ def _fetch_json(url: str, retries: int = 5, backoff: float = 2.0) -> dict:
     raise RuntimeError("Unable to fetch data")
 
 
-def fetch_prices(symbol: str, range_: str, interval: str) -> Tuple[List[dt.date], List[float]]:
+def fetch_prices(
+    symbol: str,
+    range_: str,
+    interval: str,
+    config: RequestConfig,
+) -> Tuple[List[dt.date], List[float]]:
     params = urllib.parse.urlencode({"range": range_, "interval": interval})
     url = f"{YAHOO_CHART_URL.format(symbol=symbol)}?{params}"
-    data = _fetch_json(url)
+    data = _fetch_json(url, config)
     result = data.get("chart", {}).get("result", [])
     if not result:
         error = data.get("chart", {}).get("error")
@@ -200,40 +231,74 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
     parser.add_argument("--train-split", type=float, default=0.8)
     parser.add_argument("--epochs", type=int, default=500)
     parser.add_argument("--lr", type=float, default=0.1)
+    parser.add_argument(
+        "--retries",
+        type=int,
+        default=DEFAULT_RETRIES,
+        help="Numero massimo di retry per richieste Yahoo",
+    )
+    parser.add_argument(
+        "--backoff",
+        type=float,
+        default=DEFAULT_BACKOFF,
+        help="Fattore di backoff (secondi) tra i retry",
+    )
+    parser.add_argument(
+        "--timeout",
+        type=float,
+        default=DEFAULT_TIMEOUT,
+        help="Timeout per ogni richiesta HTTP (secondi)",
+    )
+    parser.add_argument(
+        "--throttle",
+        type=float,
+        default=DEFAULT_THROTTLE,
+        help="Attesa minima tra richieste HTTP (secondi)",
+    )
     return parser.parse_args(argv)
 
 
 def main(argv: List[str]) -> int:
     args = parse_args(argv)
-    dates, prices = fetch_prices(args.symbol, args.range_, args.interval)
-    features, targets = build_dataset(prices)
-    if not features:
-        raise ValueError("Feature set empty; try a longer range")
+    config = RequestConfig(
+        retries=args.retries,
+        backoff=args.backoff,
+        timeout=args.timeout,
+        throttle=args.throttle,
+    )
+    try:
+        dates, prices = fetch_prices(args.symbol, args.range_, args.interval, config)
+        features, targets = build_dataset(prices)
+        if not features:
+            raise ValueError("Feature set empty; try a longer range")
 
-    features_scaled, means, stds = _standardize(features)
-    split_index = int(len(features_scaled) * args.train_split)
-    train_x = features_scaled[:split_index]
-    train_y = targets[:split_index]
-    test_x = features_scaled[split_index:]
-    test_y = targets[split_index:]
+        features_scaled, _, _ = _standardize(features)
+        split_index = int(len(features_scaled) * args.train_split)
+        train_x = features_scaled[:split_index]
+        train_y = targets[:split_index]
+        test_x = features_scaled[split_index:]
+        test_y = targets[split_index:]
 
-    weights = train_logistic_regression(train_x, train_y, epochs=args.epochs, lr=args.lr)
-    test_accuracy = accuracy(weights, test_x, test_y)
+        weights = train_logistic_regression(train_x, train_y, epochs=args.epochs, lr=args.lr)
+        test_accuracy = accuracy(weights, test_x, test_y)
 
-    last_row = features_scaled[-1]
-    prob_up = predict_probability(weights, last_row)
-    last_date = dates[-1]
+        last_row = features_scaled[-1]
+        prob_up = predict_probability(weights, last_row)
+        last_date = dates[-1]
 
-    print("Previsione ETF (modello ML semplice)")
-    print("=" * 40)
-    print(f"Simbolo: {args.symbol}")
-    print(f"Periodo: {dates[0].isoformat()} -> {dates[-1].isoformat()}")
-    print(f"Dati train: {len(train_x)} | test: {len(test_x)}")
-    print(f"Accuratezza test: {test_accuracy * 100:.2f}%")
-    print(f"Ultima data disponibile: {last_date.isoformat()}")
-    print(f"Probabilità rialzo prossimo giorno: {prob_up * 100:.2f}%")
-    print("Nota: modello didattico, non è consulenza finanziaria.")
-    return 0
+        print("Previsione ETF (modello ML semplice)")
+        print("=" * 40)
+        print(f"Simbolo: {args.symbol}")
+        print(f"Periodo: {dates[0].isoformat()} -> {dates[-1].isoformat()}")
+        print(f"Dati train: {len(train_x)} | test: {len(test_x)}")
+        print(f"Accuratezza test: {test_accuracy * 100:.2f}%")
+        print(f"Ultima data disponibile: {last_date.isoformat()}")
+        print(f"Probabilità rialzo prossimo giorno: {prob_up * 100:.2f}%")
+        print("Nota: modello didattico, non è consulenza finanziaria.")
+        return 0
+    except (ValueError, urllib.error.URLError, urllib.error.HTTPError) as exc:
+        print(f"Errore: {exc}", file=sys.stderr)
+        return 2
 
 
 if __name__ == "__main__":

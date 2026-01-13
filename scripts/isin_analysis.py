@@ -18,6 +18,19 @@ from typing import Iterable, List, Tuple
 YAHOO_SEARCH_URL = "https://query1.finance.yahoo.com/v1/finance/search"
 YAHOO_CHART_URL = "https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
 TRADING_DAYS = 252
+DEFAULT_TIMEOUT = 20
+DEFAULT_RETRIES = 5
+DEFAULT_BACKOFF = 2.0
+DEFAULT_THROTTLE = 1.5
+_LAST_REQUEST_AT = 0.0
+
+
+@dataclass
+class RequestConfig:
+    retries: int = DEFAULT_RETRIES
+    backoff: float = DEFAULT_BACKOFF
+    timeout: float = DEFAULT_TIMEOUT
+    throttle: float = DEFAULT_THROTTLE
 
 
 @dataclass
@@ -43,7 +56,18 @@ class AnalysisResult:
     sma_200: float | None
 
 
-def _fetch_json(url: str, retries: int = 5, backoff: float = 2.0) -> dict:
+def _throttle_requests(throttle: float) -> None:
+    global _LAST_REQUEST_AT
+    if throttle <= 0:
+        return
+    now = time.monotonic()
+    elapsed = now - _LAST_REQUEST_AT
+    if elapsed < throttle:
+        time.sleep(throttle - elapsed)
+    _LAST_REQUEST_AT = time.monotonic()
+
+
+def _fetch_json(url: str, config: RequestConfig) -> dict:
     headers = {
         "User-Agent": (
             "Mozilla/5.0 (X11; Linux x86_64) "
@@ -53,15 +77,16 @@ def _fetch_json(url: str, retries: int = 5, backoff: float = 2.0) -> dict:
     }
     attempt = 0
     last_error: Exception | None = None
-    while attempt <= retries:
+    while attempt <= config.retries:
         try:
+            _throttle_requests(config.throttle)
             request = urllib.request.Request(url, headers=headers)
-            with urllib.request.urlopen(request, timeout=15) as response:
+            with urllib.request.urlopen(request, timeout=config.timeout) as response:
                 payload = response.read().decode("utf-8")
             return json.loads(payload)
         except urllib.error.HTTPError as exc:
             last_error = exc
-            if exc.code not in {429, 500, 502, 503, 504} or attempt == retries:
+            if exc.code not in {429, 500, 502, 503, 504} or attempt == config.retries:
                 raise
             retry_after = exc.headers.get("Retry-After")
             if retry_after:
@@ -73,9 +98,9 @@ def _fetch_json(url: str, retries: int = 5, backoff: float = 2.0) -> dict:
                     pass
         except urllib.error.URLError as exc:
             last_error = exc
-            if attempt == retries:
+            if attempt == config.retries:
                 raise
-        sleep_for = backoff * (2**attempt)
+        sleep_for = config.backoff * (2**attempt)
         time.sleep(sleep_for)
         attempt += 1
     if last_error is not None:
@@ -83,10 +108,10 @@ def _fetch_json(url: str, retries: int = 5, backoff: float = 2.0) -> dict:
     raise RuntimeError("Unable to fetch data")
 
 
-def search_symbol(isin: str) -> Tuple[str, str, str]:
+def search_symbol(isin: str, config: RequestConfig) -> Tuple[str, str, str]:
     query = urllib.parse.urlencode({"q": isin, "quotesCount": 10, "newsCount": 0})
     url = f"{YAHOO_SEARCH_URL}?{query}"
-    data = _fetch_json(url)
+    data = _fetch_json(url, config)
     quotes = data.get("quotes", [])
     if not quotes:
         raise ValueError(f"No Yahoo Finance results found for ISIN {isin}")
@@ -109,10 +134,10 @@ def search_symbol(isin: str) -> Tuple[str, str, str]:
     return symbol, name, currency
 
 
-def fetch_prices(symbol: str, range_: str, interval: str) -> PriceSeries:
+def fetch_prices(symbol: str, range_: str, interval: str, config: RequestConfig) -> PriceSeries:
     params = urllib.parse.urlencode({"range": range_, "interval": interval})
     url = f"{YAHOO_CHART_URL.format(symbol=symbol)}?{params}"
-    data = _fetch_json(url)
+    data = _fetch_json(url, config)
     result = data.get("chart", {}).get("result", [])
     if not result:
         error = data.get("chart", {}).get("error")
@@ -274,30 +299,64 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
         "--symbol",
         help="Simbolo Yahoo da usare al posto della ricerca ISIN",
     )
+    parser.add_argument(
+        "--retries",
+        type=int,
+        default=DEFAULT_RETRIES,
+        help="Numero massimo di retry per richieste Yahoo",
+    )
+    parser.add_argument(
+        "--backoff",
+        type=float,
+        default=DEFAULT_BACKOFF,
+        help="Fattore di backoff (secondi) tra i retry",
+    )
+    parser.add_argument(
+        "--timeout",
+        type=float,
+        default=DEFAULT_TIMEOUT,
+        help="Timeout per ogni richiesta HTTP (secondi)",
+    )
+    parser.add_argument(
+        "--throttle",
+        type=float,
+        default=DEFAULT_THROTTLE,
+        help="Attesa minima tra richieste HTTP (secondi)",
+    )
     return parser.parse_args(argv)
 
 
 def main(argv: List[str]) -> int:
     args = parse_args(argv)
+    config = RequestConfig(
+        retries=args.retries,
+        backoff=args.backoff,
+        timeout=args.timeout,
+        throttle=args.throttle,
+    )
 
-    if args.input_data:
-        series = load_series(args.input_data)
-        symbol = args.symbol or "LOCAL_DATA"
-        name = symbol
-        currency = ""
-    else:
-        if args.symbol:
-            symbol = args.symbol
-            name = args.symbol
+    try:
+        if args.input_data:
+            series = load_series(args.input_data)
+            symbol = args.symbol or "LOCAL_DATA"
+            name = symbol
             currency = ""
         else:
-            symbol, name, currency = search_symbol(args.isin)
-        series = fetch_prices(symbol, args.range_, args.interval)
-        if args.save_data:
-            save_series(args.save_data, series)
-    result = analyze(symbol, name, currency, series)
-    print_report(result)
-    return 0
+            if args.symbol:
+                symbol = args.symbol
+                name = args.symbol
+                currency = ""
+            else:
+                symbol, name, currency = search_symbol(args.isin, config)
+            series = fetch_prices(symbol, args.range_, args.interval, config)
+            if args.save_data:
+                save_series(args.save_data, series)
+        result = analyze(symbol, name, currency, series)
+        print_report(result)
+        return 0
+    except (ValueError, urllib.error.URLError, urllib.error.HTTPError) as exc:
+        print(f"Errore: {exc}", file=sys.stderr)
+        return 2
 
 
 if __name__ == "__main__":
